@@ -36,7 +36,7 @@ HADOOP_JOB_LIST_NUM_RE = re.compile(r'(\d+) jobs currently running')
 HADOOP_JOB_LIST_INFO_RE = re.compile(r'(\S+)\s+\d+\s+\d+\s+hadoop\s+\w+\s+\w+')
 
 
-log = logging.getLogger('mrjob.ssh')
+log = logging.getLogger(__name__)
 
 
 def _ssh_args(ssh_bin, address, ec2_key_pair_file):
@@ -82,8 +82,8 @@ def ssh_run(ssh_bin, address, ec2_key_pair_file, cmd_args, stdin=''):
     return p.communicate(stdin)
 
 
-def ssh_run_with_recursion(ssh_bin, address, ec2_key_pair_file,
-                            keyfile, cmd_args):
+def ssh_run_with_recursion(ssh_bin, address, ec2_key_pair_file, keyfile,
+                           cmd_args):
     """Some files exist on the master and can be accessed directly via SSH,
     but some files are on the slaves which can only be accessed via the master
     node. To differentiate between hosts, we adopt the UUCP "bang path" syntax
@@ -101,10 +101,10 @@ def ssh_run_with_recursion(ssh_bin, address, ec2_key_pair_file,
             raise ValueError('SSH key file path cannot be None')
         host1, host2 = address.split('!')
         more_args = [
-           'ssh', '-i', keyfile,
-           '-o', 'StrictHostKeyChecking=no',
-           '-o', 'UserKnownHostsFile=/dev/null',
-           'hadoop@%s' % host2,
+            'ssh', '-i', keyfile,
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'UserKnownHostsFile=/dev/null',
+            'hadoop@%s' % (host2,),
         ]
         return ssh_run(ssh_bin, host1, ec2_key_pair_file,
                        more_args + list(cmd_args))

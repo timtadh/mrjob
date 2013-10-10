@@ -1,4 +1,4 @@
-# Copyright 2009-2012 Yelp
+# Copyright 2009-2013 Yelp and Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@ __credits__ = [
     'Benjamin Goldenberg <benjamin@yelp.com',
     'Peter Harrington <peter.b.harrington@gmail.com>',
     'Brandon Haynes <bhaynes@fas.harvard.edu>',
+    'Tom Hennigan <tomhennigan@gmail.com>',
     'Brett Hoerner <brett@bretthoerner.com>',
     'Evan Klitzke <evan@eklitzke.org>',
     'Tom Janofsky <tjanofsky@monetate.com>',
@@ -43,11 +44,14 @@ __credits__ = [
     'Nikolaos Koutsopoulos <nhk@mochimedia.com>',
     'Julian Krause <juliank@yelp.com>',
     'Robert Leftwich <rl.0x0@eml.cc>',
+    'Baris Metin <bmetin@yelp.com>',
     'Tetsuya Morimoto <tetsuya.morimoto@gmail.com>',
+    'Sean Myers <seanmyers0608@gmail.com>',
     'Oliver Nicholas <bigo@wonlove.net>',
+    'Andrew Price <andrew.price@ensighten.com>',
     'Matt Perry <matt@unshift.net>',
     'Pavel Repin <prepin@gmail.com>',
-    'Wahbeh Qardaji <wqardaji@yelp.com>',
+    'Wahbeh Qardaji <wahbeh.qardaji@gmail.com>',
     'Jimmy Retzlaff <jretz@yelp.com>',
     'Ned Rockson <ned@tellapart.com>',
     'Paul Scott <paul@duedil.com>',
@@ -60,4 +64,4 @@ __credits__ = [
     'Derek Wilson <jderekwilson@gmail.com>',
 ]
 
-__version__ = '0.4.1-dev'
+__version__ = '0.4.1'

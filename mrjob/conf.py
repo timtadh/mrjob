@@ -1,4 +1,5 @@
 # Copyright 2009-2012 Yelp
+# Copyright 2013 David Marin
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,7 +43,7 @@ except ImportError:
 from mrjob.util import shlex_split
 
 
-log = logging.getLogger('mrjob.conf')
+log = logging.getLogger(__name__)
 
 
 class OptionStore(dict):
@@ -107,41 +108,25 @@ def find_mrjob_conf():
 
     - The location specified by :envvar:`MRJOB_CONF`
     - :file:`~/.mrjob.conf`
-    - :file:`~/.mrjob` (deprecated)
-    - :file:`mrjob.conf` in any directory in :envvar:`PYTHONPATH` (deprecated)
     - :file:`/etc/mrjob.conf`
 
-    Return ``None`` if we can't find it. Print a warning if its location is
-    deprecated.
+    Return ``None`` if we can't find it.
     """
     def candidates():
-        """Return (path, deprecation_warning)"""
         if 'MRJOB_CONF' in os.environ:
-            yield (expand_path(os.environ['MRJOB_CONF']), None)
+            yield expand_path(os.environ['MRJOB_CONF'])
 
         # $HOME isn't necessarily set on Windows, but ~ works
         # use os.path.join() so we don't end up mixing \ and /
-        yield (expand_path(os.path.join('~', '.mrjob.conf')), None)
-
-        # DEPRECATED:
-        yield (expand_path(os.path.join('~', '.mrjob')),
-                           'use ~/.mrjob.conf instead.')
-        if os.environ.get('PYTHONPATH'):
-            for dirname in os.environ['PYTHONPATH'].split(os.pathsep):
-                yield (os.path.join(dirname, 'mrjob.conf'),
-                      'Use $MRJOB_CONF to explicitly specify the path'
-                       ' instead.')
+        yield expand_path(os.path.join('~', '.mrjob.conf'))
 
         # this only really makes sense on Unix, so no os.path.join()
-        yield ('/etc/mrjob.conf', None)
+        yield '/etc/mrjob.conf'
 
-    for path, deprecation_message in candidates():
+    for path in candidates():
         log.debug('looking for configs in %s' % path)
         if os.path.exists(path):
             log.info('using configs in %s' % path)
-            if deprecation_message:
-                log.warning('This config path is deprecated and will stop'
-                            ' working in mrjob 0.4. %s' % deprecation_message)
             return path
     else:
         log.info("no configs found; falling back on auto-configuration")
@@ -217,12 +202,14 @@ def load_opts_from_mrjob_conf(runner_alias, conf_path=None,
 
         for include in includes:
             if include in already_loaded:
-                log.warn('%s tries to recursively include %s! (Already included:'
-                         ' %s)' % (conf_path, conf['include'],
-                                   ', '.join(already_loaded)))
+                log.warn('%s tries to recursively include %s! (Already'
+                         ' included:  %s)' % (
+                             conf_path, conf['include'],
+                             ', '.join(already_loaded)))
             else:
-                inherited.extend(load_opts_from_mrjob_conf(
-                                    runner_alias, include, already_loaded))
+                inherited.extend(
+                    load_opts_from_mrjob_conf(
+                        runner_alias, include, already_loaded))
     return inherited + [(conf_path, values)]
 
 

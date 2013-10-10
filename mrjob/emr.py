@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Copyright 2009-2012 Yelp and Contributors
+# Copyright 2009-2013 Yelp and Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -49,6 +49,7 @@ try:
     import boto.emr.connection
     import boto.emr.instance_group
     import boto.exception
+    import boto.regioninfo
     import boto.utils
     boto  # quiet "redefinition of unused ..." warning from pyflakes
 except ImportError:
@@ -56,10 +57,21 @@ except ImportError:
     # inside hadoop streaming
     boto = None
 
+# need this to retry on SSL errors (see Issue #621)
+try:
+    from boto.https_connection import InvalidCertificateException
+    InvalidCertificateException  # quiet pyflakes warning
+except ImportError:
+    InvalidCertificateException = None
+
 import mrjob
-from mrjob.setup import BootstrapWorkingDirManager
-from mrjob.setup import UploadDirManager
-from mrjob.setup import parse_legacy_hash_path
+from mrjob.aws import EC2_INSTANCE_TYPE_TO_COMPUTE_UNITS
+from mrjob.aws import EC2_INSTANCE_TYPE_TO_MEMORY
+from mrjob.aws import MAX_STEPS_PER_JOB_FLOW
+from mrjob.aws import emr_endpoint_for_region
+from mrjob.aws import emr_ssl_host_for_region
+from mrjob.aws import s3_endpoint_for_region
+from mrjob.aws import s3_location_constraint_for_region
 from mrjob.compat import supports_new_distributed_cache_options
 from mrjob.conf import combine_cmds
 from mrjob.conf import combine_dicts
@@ -83,8 +95,12 @@ from mrjob.parse import is_uri
 from mrjob.parse import parse_s3_uri
 from mrjob.pool import est_time_to_hour
 from mrjob.pool import pool_hash_and_name
+from mrjob.retry import RetryGoRound
 from mrjob.runner import MRJobRunner
 from mrjob.runner import RunnerOptionStore
+from mrjob.setup import BootstrapWorkingDirManager
+from mrjob.setup import UploadDirManager
+from mrjob.setup import parse_legacy_hash_path
 from mrjob.ssh import ssh_copy_key
 from mrjob.ssh import ssh_terminate_single_job
 from mrjob.ssh import ssh_slave_addresses
@@ -96,7 +112,7 @@ from mrjob.util import hash_object
 from mrjob.util import shlex_split
 
 
-log = logging.getLogger('mrjob.emr')
+log = logging.getLogger(__name__)
 
 JOB_TRACKER_RE = re.compile(r'(\d{1,3}\.\d{2})%')
 
@@ -120,8 +136,8 @@ JOB_FLOW_SLEEP_INTERVAL = 30.01  # Add .1 seconds so minutes arent spot on.
 # with boto.utils.ISO8601
 SUBSECOND_RE = re.compile('\.[0-9]+')
 
-# map from AWS region to EMR endpoint. See
-# http://docs.amazonwebservices.com/general/latest/gr/rande.html#emr_region
+# Deprecated as of v0.4.1 (will be removed in v0.5).
+# Use mrjob.aws.emr_endpoint_for_region() instead
 REGION_TO_EMR_ENDPOINT = {
     'us-east-1': 'elasticmapreduce.us-east-1.amazonaws.com',
     'us-west-1': 'elasticmapreduce.us-west-1.amazonaws.com',
@@ -134,8 +150,8 @@ REGION_TO_EMR_ENDPOINT = {
     '': 'elasticmapreduce.amazonaws.com',  # when no region specified
 }
 
-# map from AWS region to S3 endpoint. See
-# http://docs.amazonwebservices.com/general/latest/gr/rande.html#s3_region
+# Deprecated as of v0.4.1 (will be removed in v0.5).
+# Use mrjob.aws.s3_endpoint_for_region() instead
 REGION_TO_S3_ENDPOINT = {
     'us-east-1': 's3.amazonaws.com',  # no region-specific endpoint
     'us-west-1': 's3-us-west-1.amazonaws.com',
@@ -148,49 +164,17 @@ REGION_TO_S3_ENDPOINT = {
     '': 's3.amazonaws.com',
 }
 
-# map from AWS region to S3 LocationConstraint parameter for regions whose
-# location constraints differ from their AWS regions. See
-# http://docs.amazonwebservices.com/AmazonS3/latest/API/index.html?RESTBucketPUT.html
+# Deprecated as of v0.4.1 (will be removed in v0.5).
+# Use mrjob.aws.s3_location_constraint_for_region() instead
 REGION_TO_S3_LOCATION_CONSTRAINT = {
     'us-east-1': '',
 }
 
-
-# map from instance type to number of compute units
-# from http://aws.amazon.com/ec2/instance-types/
-EC2_INSTANCE_TYPE_TO_COMPUTE_UNITS = {
-    't1.micro': 2,
-    'm1.small': 1,
-    'm1.large': 4,
-    'm1.xlarge': 8,
-    'm2.xlarge': 6.5,
-    'm2.2xlarge': 13,
-    'm2.4xlarge': 26,
-    'c1.medium': 5,
-    'c1.xlarge': 20,
-    'cc1.4xlarge': 33.5,
-    'cg1.4xlarge': 33.5,
-}
-
-
-# map from instance type to GB of memory
-# from http://aws.amazon.com/ec2/instance-types/
-EC2_INSTANCE_TYPE_TO_MEMORY = {
-    't1.micro': 0.6,
-    'm1.small': 1.7,
-    'm1.large': 7.5,
-    'm1.xlarge': 15,
-    'm2.xlarge': 17.5,
-    'm2.2xlarge': 34.2,
-    'm2.4xlarge': 68.4,
-    'c1.medium': 1.7,
-    'c1.xlarge': 7,
-    'cc1.4xlarge': 23,
-    'cg1.4xlarge': 22,
-}
-
-# EMR's hard limit on number of steps in a job flow
-MAX_STEPS_PER_JOB_FLOW = 256
+# bootstrap action which automatically terminates idle job flows
+_MAX_HOURS_IDLE_BOOTSTRAP_ACTION_PATH = os.path.join(
+    os.path.dirname(mrjob.__file__),
+    'bootstrap',
+    'terminate_idle_job_flow.sh')
 
 
 def s3_key_to_uri(s3_key):
@@ -350,6 +334,8 @@ class LogFetchError(Exception):
 
 class EMRRunnerOptionStore(RunnerOptionStore):
 
+    # documentation of these options is in docs/guides/emr-opts.rst
+
     ALLOWED_KEYS = RunnerOptionStore.ALLOWED_KEYS.union(set([
         'additional_emr_info',
         'ami_version',
@@ -379,6 +365,8 @@ class EMRRunnerOptionStore(RunnerOptionStore):
         'enable_emr_debugging',
         'hadoop_streaming_jar_on_emr',
         'hadoop_version',
+        'max_hours_idle',
+        'mins_to_end_of_hour',
         'num_ec2_core_instances',
         'pool_wait_minutes',
         'num_ec2_instances',
@@ -420,8 +408,9 @@ class EMRRunnerOptionStore(RunnerOptionStore):
             'ec2_master_instance_type': 'm1.small',
             'emr_job_flow_pool_name': 'default',
             'hadoop_version': None,
-            'hadoop_streaming_jar_on_emr':
-                '/home/hadoop/contrib/streaming/hadoop-streaming.jar',
+            'hadoop_streaming_jar_on_emr': (
+                '/home/hadoop/contrib/streaming/hadoop-streaming.jar'),
+            'mins_to_end_of_hour': 5.0,
             'num_ec2_core_instances': 0,
             'num_ec2_instances': 1,
             'num_ec2_task_instances': 0,
@@ -509,7 +498,7 @@ class EMRRunnerOptionStore(RunnerOptionStore):
 
             # task instances
             if (self._opt_priority['ec2_instance_type'] >
-                self._opt_priority['ec2_task_instance_type']):
+                    self._opt_priority['ec2_task_instance_type']):
                 self['ec2_task_instance_type'] = ec2_instance_type
 
         # convert a bid price of '0' to None
@@ -682,7 +671,7 @@ class EMRJobRunner(MRJobRunner):
 
             # make sure they can communicate if both specified
             if (self._aws_region and bucket_loc and
-                self._aws_region != bucket_loc):
+                    self._aws_region != bucket_loc):
                 log.warning('warning: aws_region (%s) does not match bucket'
                             ' region (%s). Your EC2 instances may not be able'
                             ' to reach your S3 buckets.' %
@@ -770,10 +759,9 @@ class EMRJobRunner(MRJobRunner):
             s3_conn = self.make_s3_conn()
             log.info('creating S3 bucket %r to use as scratch space' %
                      self._s3_temp_bucket_to_create)
-            location = REGION_TO_S3_LOCATION_CONSTRAINT.get(
-                self._aws_region, self._aws_region)
-            s3_conn.create_bucket(self._s3_temp_bucket_to_create,
-                                  location=(location or ''))
+            location = s3_location_constraint_for_region(self._aws_region)
+            s3_conn.create_bucket(
+                self._s3_temp_bucket_to_create, location=location)
             self._s3_temp_bucket_to_create = None
 
     def _check_and_fix_s3_dir(self, s3_uri):
@@ -798,14 +786,7 @@ class EMRJobRunner(MRJobRunner):
             if self._opts['s3_endpoint']:
                 s3_endpoint = self._opts['s3_endpoint']
             else:
-                # look it up in our table
-                try:
-                    s3_endpoint = REGION_TO_S3_ENDPOINT[self._aws_region]
-                except KeyError:
-                    raise Exception(
-                        "Don't know the S3 endpoint for %s;"
-                        " try setting s3_endpoint explicitly" % (
-                            self._aws_region))
+                s3_endpoint = s3_endpoint_for_region(self._aws_region)
 
             self._s3_fs = S3Filesystem(self._opts['aws_access_key_id'],
                                        self._opts['aws_secret_access_key'],
@@ -862,12 +843,14 @@ class EMRJobRunner(MRJobRunner):
         except boto.exception.S3ResponseError:
             pass
 
-    def _add_bootstrap_files_for_upload(self):
+    def _add_bootstrap_files_for_upload(self, persistent=False):
         """Add files needed by the bootstrap script to self._upload_mgr.
 
         Tar up mrjob if bootstrap_mrjob is True.
 
         Create the master bootstrap script if necessary.
+
+        persistent -- set by make_persistent_job_flow()
         """
         # lazily create mrjob.tar.gz
         if self._opts['bootstrap_mrjob']:
@@ -885,9 +868,14 @@ class EMRJobRunner(MRJobRunner):
         if self._master_bootstrap_script_path:
             self._upload_mgr.add(self._master_bootstrap_script_path)
 
-        # finally, make sure bootstrap action scripts are on S3
+        # make sure bootstrap action scripts are on S3
         for bootstrap_action in self._bootstrap_actions:
             self._upload_mgr.add(bootstrap_action['path'])
+
+        # Add max-hours-idle script if we need it
+        if (self._opts['max_hours_idle'] and
+                (persistent or self._opts['pool_emr_job_flows'])):
+            self._upload_mgr.add(_MAX_HOURS_IDLE_BOOTSTRAP_ACTION_PATH)
 
     def _add_job_files_for_upload(self):
         """Add files needed for running the job (setup and input)
@@ -1040,7 +1028,7 @@ class EMRJobRunner(MRJobRunner):
         # don't stop it if it was created due to --pool because the user
         # probably wants to use it again
         if self._emr_job_flow_id and not self._opts['emr_job_flow_id'] \
-           and not self._opts['pool_emr_job_flows']:
+                and not self._opts['pool_emr_job_flows']:
             log.info('Terminating job flow: %s' % self._emr_job_flow_id)
             try:
                 self.make_emr_conn().terminate_jobflow(self._emr_job_flow_id)
@@ -1063,7 +1051,7 @@ class EMRJobRunner(MRJobRunner):
         # delete the log files, if it's a job flow we created (the logs
         # belong to the job flow)
         if self._s3_job_log_uri and not self._opts['emr_job_flow_id'] \
-           and not self._opts['pool_emr_job_flows']:
+                and not self._opts['pool_emr_job_flows']:
             try:
                 log.info('Removing all files in %s' % self._s3_job_log_uri)
                 self.rm(self._s3_job_log_uri)
@@ -1136,12 +1124,12 @@ class EMRJobRunner(MRJobRunner):
             # mockboto throws this for some reason
             return
         if (jobflow.keepjobflowalivewhennosteps == 'true' and
-            jobflow.state == 'WAITING'):
+                jobflow.state == 'WAITING'):
             raise Exception('Operation requires job flow to terminate, but'
                             ' it may never do so.')
         while not self._job_flow_is_done(jobflow):
-            msg = 'Waiting for job flow to terminate (currently %s)' % \
-                                                         jobflow.state
+            msg = 'Waiting for job flow to terminate (currently %s)' % (
+                jobflow.state)
             log.info(msg)
             time.sleep(self._opts['check_emr_status_every'])
             jobflow = self._describe_jobflow()
@@ -1164,8 +1152,7 @@ class EMRJobRunner(MRJobRunner):
             if self._opts['ec2_instance_type']:
                 instance_type = self._opts['ec2_instance_type']
             else:
-                raise ValueError('Missing instance type for %s node(s)'
-                    % role)
+                raise ValueError('Missing instance type for %s node(s)' % role)
 
         if bid_price:
             market = 'SPOT'
@@ -1185,7 +1172,7 @@ class EMRJobRunner(MRJobRunner):
         """Create an empty job flow on EMR, and return the ID of that
         job.
 
-        persistent -- if this is true, create the job flow with the --alive
+        persistent -- if this is true, create the job flow with the keep_alive
             option, indicating the job will have to be manually terminated.
         """
         # make sure we can see the files we copied to S3
@@ -1265,7 +1252,7 @@ class EMRJobRunner(MRJobRunner):
             s3_uri = self._upload_mgr.uri(bootstrap_action['path'])
             bootstrap_action_args.append(
                 boto.emr.BootstrapAction(
-                'action %d' % i, s3_uri, bootstrap_action['args']))
+                    'action %d' % i, s3_uri, bootstrap_action['args']))
 
         if self._master_bootstrap_script_path:
             master_bootstrap_script_args = []
@@ -1280,6 +1267,20 @@ class EMRJobRunner(MRJobRunner):
                     self._upload_mgr.uri(self._master_bootstrap_script_path),
                     master_bootstrap_script_args))
 
+        if persistent or self._opts['pool_emr_job_flows']:
+            args['keep_alive'] = True
+
+            # only use idle termination script on persistent job flows
+            # add it last, so that we don't count bootstrapping as idle time
+            if self._opts['max_hours_idle']:
+                s3_uri = self._upload_mgr.uri(
+                    _MAX_HOURS_IDLE_BOOTSTRAP_ACTION_PATH)
+                # script takes args in (integer) seconds
+                ba_args = [int(self._opts['max_hours_idle'] * 3600),
+                           int(self._opts['mins_to_end_of_hour'] * 60)]
+                bootstrap_action_args.append(
+                    boto.emr.BootstrapAction('idle timeout', s3_uri, ba_args))
+
         if bootstrap_action_args:
             args['bootstrap_actions'] = bootstrap_action_args
 
@@ -1293,47 +1294,47 @@ class EMRJobRunner(MRJobRunner):
             args['additional_info'] = self._opts['additional_emr_info']
 
         if self._opts['visible_to_all_users']:
-            args['visible_to_all_users'] = True
-
-        if persistent or self._opts['pool_emr_job_flows']:
-            args['keep_alive'] = True
+            # Issue #701: this keyword arg was added to run_jobflow()
+            # in boto 2.8.0, but we only require boto 2.2.0. So use
+            # api_params instead.
+            args.setdefault('api_params', {})
+            args['api_params']['VisibleToAllUsers'] = 'true'
 
         if steps:
             args['steps'] = steps
 
         return args
 
+    @property
+    def _action_on_failure(self):
+        # don't terminate other people's job flows
+        if (self._opts['emr_job_flow_id'] or
+                self._opts['pool_emr_job_flows']):
+            return 'CANCEL_AND_WAIT'
+        else:
+            return 'TERMINATE_JOB_FLOW'
+
     def _build_steps(self):
         """Return a list of boto Step objects corresponding to the
         steps we want to run."""
         # quick, add the other steps before the job spins up and
         # then shuts itself down (in practice this takes several minutes)
-        steps = self._get_steps()
-        step_list = []
+        return [self._build_step(n) for n in xrange(self._num_steps())]
 
-        for step_num, step in enumerate(steps):
-            if step['type'] == 'streaming':
-                step_list.append(
-                    self._build_streaming_step(step, step_num, len(steps)))
-            elif step['type'] == 'jar':
-                step_list.append(
-                    self._build_jar_step(step, step_num, len(steps)))
+    def _build_step(self, step_num):
+        step = self._get_step(step_num)
 
-        return step_list
-
-    @property
-    def _action_on_failure(self):
-        # don't terminate other people's job flows
-        if (self._opts['emr_job_flow_id'] or
-            self._opts['pool_emr_job_flows']):
-            return 'CANCEL_AND_WAIT'
+        if step['type'] == 'streaming':
+            return self._build_streaming_step(step_num)
+        elif step['type'] == 'jar':
+            return self._build_jar_step(step_num)
         else:
-            return 'TERMINATE_JOB_FLOW'
+            raise AssertionError('Bad step type: %r' % (step['type'],))
 
-    def _build_streaming_step(self, step, step_num, num_steps):
+    def _build_streaming_step(self, step_num):
         streaming_step_kwargs = {
             'name': '%s: Step %d of %d' % (
-                self._job_name, step_num + 1, num_steps),
+                self._job_name, step_num + 1, self._num_steps()),
             'input': self._s3_step_input_uris(step_num),
             'output': self._s3_step_output_uri(step_num),
             'jar': self._get_jar(),
@@ -1343,10 +1344,10 @@ class EMRJobRunner(MRJobRunner):
         streaming_step_kwargs.update(self._cache_kwargs())
 
         streaming_step_kwargs['step_args'].extend(
-            self._hadoop_conf_args(step, step_num, num_steps))
+            self._hadoop_args_for_step(step_num))
 
         mapper, combiner, reducer = (
-            self._hadoop_streaming_commands(step, step_num))
+            self._hadoop_streaming_commands(step_num))
 
         streaming_step_kwargs['mapper'] = mapper
 
@@ -1469,7 +1470,7 @@ class EMRJobRunner(MRJobRunner):
         # define out steps
         steps = self._build_steps()
         log.debug('Calling add_jobflow_steps(%r, %r)' % (
-                self._emr_job_flow_id, steps))
+            self._emr_job_flow_id, steps))
         emr_conn.add_jobflow_steps(self._emr_job_flow_id, steps)
 
         # keep track of when we launched our job
@@ -1507,7 +1508,7 @@ class EMRJobRunner(MRJobRunner):
             latest_lg_step_num = 0
             for i, step in enumerate(steps):
                 if LOG_GENERATING_STEP_NAME_RE.match(
-                    posixpath.basename(step.jar)):
+                        posixpath.basename(getattr(step, 'jar', ''))):
                     latest_lg_step_num += 1
 
                 # ignore steps belonging to other jobs
@@ -1516,7 +1517,7 @@ class EMRJobRunner(MRJobRunner):
 
                 step_nums.append(i + 1)
                 if LOG_GENERATING_STEP_NAME_RE.match(
-                    posixpath.basename(step.jar)):
+                        posixpath.basename(getattr(step, 'jar', ''))):
                     lg_step_num_mapping[i + 1] = latest_lg_step_num
 
                 step.state = step.state
@@ -1525,7 +1526,7 @@ class EMRJobRunner(MRJobRunner):
                     running_step_name = step.name
 
                 if (hasattr(step, 'startdatetime') and
-                    hasattr(step, 'enddatetime')):
+                        hasattr(step, 'enddatetime')):
                     start_time = iso8601_to_timestamp(step.startdatetime)
                     end_time = iso8601_to_timestamp(step.enddatetime)
                     total_step_time += end_time - start_time
@@ -1558,9 +1559,9 @@ class EMRJobRunner(MRJobRunner):
                         tracker_page = ''.join(tracker_handle.readlines())
                         tracker_handle.close()
                         # first two formatted percentages, map then reduce
-                        map_complete, reduce_complete = [float(complete)
-                            for complete in JOB_TRACKER_RE.findall(
-                                tracker_page)[:2]]
+                        map_complete, reduce_complete = [
+                            float(complete) for complete
+                            in JOB_TRACKER_RE.findall(tracker_page)[:2]]
                         log.info(' map %3d%% reduce %3d%%' % (
                                  map_complete, reduce_complete))
                     except:
@@ -1600,7 +1601,7 @@ class EMRJobRunner(MRJobRunner):
                 # log cause, and put it in exception
                 cause_msg = []  # lines to log and put in exception
                 cause_msg.append('Probable cause of failure (from %s):' %
-                           cause['log_file_uri'])
+                                 cause['log_file_uri'])
                 cause_msg.extend(line.strip('\n') for line in cause['lines'])
                 if cause['input_uri']:
                     cause_msg.append('(while reading from %s)' %
@@ -1650,8 +1651,9 @@ class EMRJobRunner(MRJobRunner):
     ## SSH LOG FETCHING
 
     def _ssh_path(self, relative):
-        return SSH_PREFIX + self._address_of_master() + SSH_LOG_ROOT + \
-        '/' + relative
+        return (
+            SSH_PREFIX + self._address_of_master() + SSH_LOG_ROOT + '/' +
+            relative)
 
     def _ls_ssh_logs(self, relative_path):
         """List logs over SSH by path relative to log root directory"""
@@ -1743,9 +1745,9 @@ class EMRJobRunner(MRJobRunner):
                                          step_nums)
 
     def ls_job_logs_s3(self, step_nums):
-        return  self._enforce_path_regexp(self._ls_s3_logs('jobs/'),
-                                          EMR_JOB_LOG_URI_RE,
-                                          step_nums)
+        return self._enforce_path_regexp(self._ls_s3_logs('jobs/'),
+                                         EMR_JOB_LOG_URI_RE,
+                                         step_nums)
 
     def ls_node_logs_s3(self):
         return self._enforce_path_regexp(self._ls_s3_logs('node/'),
@@ -1771,8 +1773,9 @@ class EMRJobRunner(MRJobRunner):
         # parameter
         if lg_step_num_mapping is None:
             lg_step_num_mapping = dict((n, n) for n in step_nums)
-        lg_step_nums = sorted(lg_step_num_mapping[k] for k in step_nums
-                               if k in lg_step_num_mapping)
+        lg_step_nums = sorted(
+            lg_step_num_mapping[k] for k in step_nums
+            if k in lg_step_num_mapping)
 
         self._counters = []
         new_counters = {}
@@ -1916,9 +1919,9 @@ class EMRJobRunner(MRJobRunner):
 
         # Also don't bother if we're not bootstrapping
         if not any(key.startswith('bootstrap_') and
-               key != 'bootstrap_actions' and  # these are separate scripts
-               value
-               for (key, value) in self._opts.iteritems()):
+                   key != 'bootstrap_actions' and  # these are separate scripts
+                   value
+                   for (key, value) in self._opts.iteritems()):
             return
 
         # we call the script b.py because there's a character limit on
@@ -2046,7 +2049,7 @@ class EMRJobRunner(MRJobRunner):
 
         log.info('Creating persistent job flow to run several jobs in...')
 
-        self._add_bootstrap_files_for_upload()
+        self._add_bootstrap_files_for_upload(persistent=True)
         self._upload_local_files_to_s3()
 
         # don't allow user to call run()
@@ -2121,6 +2124,9 @@ class EMRJobRunner(MRJobRunner):
                                                        float('Inf')))
 
         sort_keys_and_job_flows = []
+        # no point in showing this warning multiple times
+        # make this a list so we can set it from within add_if_match()
+        warned_about_ami_version_latest = []
 
         def add_if_match(job_flow):
             # this may be a retry due to locked job flows
@@ -2150,21 +2156,25 @@ class EMRJobRunner(MRJobRunner):
                 if job_flow_ami_version != self._opts['ami_version']:
                     return
             else:
-                log.warning(
-                    "When AMI version is set to 'latest', job flow pooling "
-                    "can result in the job being added to a pool using an "
-                    "older AMI version"
-                )
+                if not warned_about_ami_version_latest:
+                    log.warning(
+                        "When AMI version is set to 'latest', job flow pooling"
+                        " can result in the job being added to a pool using an"
+                        " older AMI version")
+                    # warned_about_... = True would just set a local variable
+                    warned_about_ami_version_latest.append(True)
 
             # there is a hard limit of 256 steps per job flow
             if len(job_flow.steps) + num_steps > MAX_STEPS_PER_JOB_FLOW:
                 return
 
             # in rare cases, job flow can be WAITING *and* have incomplete
-            # steps
-            if any(getattr(step, 'enddatetime', None) is None
-                   for step in job_flow.steps):
-                return
+            # steps. We could just check for PENDING steps, but we're
+            # trying to be defensive about EMR adding a new step state.
+            for step in job_flow.steps:
+                if (getattr(step, 'enddatetime', None) is None and
+                        getattr(step, 'state', None) != 'CANCELLED'):
+                    return
 
             # total compute units per group
             role_to_cu = defaultdict(float)
@@ -2317,7 +2327,7 @@ class EMRJobRunner(MRJobRunner):
             things_to_hash.append(mrjob.__version__)
         return hash_object(things_to_hash)
 
-    ### EMR-specific STUFF ###
+    ### EMR-specific Stuff ###
 
     def make_emr_conn(self):
         """Create a connection to EMR.
@@ -2331,35 +2341,33 @@ class EMRJobRunner(MRJobRunner):
         if boto is None:
             raise ImportError('You must install boto to connect to EMR')
 
-        region = self._get_region_info_for_emr_conn()
-        log.debug('creating EMR connection (to %s)' % region.endpoint)
+        def emr_conn_for_endpoint(endpoint):
+            return boto.emr.connection.EmrConnection(
+                aws_access_key_id=self._opts['aws_access_key_id'],
+                aws_secret_access_key=self._opts['aws_secret_access_key'],
+                region=boto.regioninfo.RegionInfo(
+                    name=self._aws_region, endpoint=endpoint))
 
-        raw_emr_conn = boto.emr.connection.EmrConnection(
-            aws_access_key_id=self._opts['aws_access_key_id'],
-            aws_secret_access_key=self._opts['aws_secret_access_key'],
-            region=region)
-        return wrap_aws_conn(raw_emr_conn)
+        endpoint = (self._opts['emr_endpoint'] or
+                    emr_endpoint_for_region(self._aws_region))
 
-    def _get_region_info_for_emr_conn(self):
-        """Get a :py:class:`boto.ec2.regioninfo.RegionInfo` object to
-        initialize EMR connections with.
+        log.debug('creating EMR connection (to %s)' % endpoint)
+        conn = emr_conn_for_endpoint(endpoint)
 
-        This is kind of silly because all
-        :py:class:`boto.emr.connection.EmrConnection` ever does with
-        this object is extract the hostname, but that's how boto rolls.
-        """
-        if self._opts['emr_endpoint']:
-            endpoint = self._opts['emr_endpoint']
-        else:
-            # look up endpoint in our table
-            try:
-                endpoint = REGION_TO_EMR_ENDPOINT[self._aws_region]
-            except KeyError:
-                raise Exception(
-                    "Don't know the EMR endpoint for %s;"
-                    " try setting emr_endpoint explicitly" % self._aws_region)
+        # Issue #621: if we're using a region-specific endpoint,
+        # try both the canonical version of the hostname and the one
+        # that matches the SSL cert
+        if (self._aws_region and not self._opts['emr_endpoint'] and
+                InvalidCertificateException):
 
-        return boto.ec2.regioninfo.RegionInfo(None, self._aws_region, endpoint)
+            ssl_host = emr_ssl_host_for_region(self._aws_region)
+            fallback_conn = emr_conn_for_endpoint(ssl_host)
+
+            conn = RetryGoRound(
+                [conn, fallback_conn],
+                lambda ex: isinstance(ex, InvalidCertificateException))
+
+        return wrap_aws_conn(conn)
 
     def _describe_jobflow(self, emr_conn=None):
         emr_conn = emr_conn or self.make_emr_conn()
@@ -2376,15 +2384,16 @@ class EMRJobRunner(MRJobRunner):
 
             # infer the version from the job flow
             self._inferred_hadoop_version = (
-                    self._describe_jobflow().hadoopversion)
+                self._describe_jobflow().hadoopversion)
             # warn if the hadoop version specified does not match the
             # inferred hadoop_version
             hadoop_version = self._opts['hadoop_version']
-            if hadoop_version and \
-               hadoop_version != self._inferred_hadoop_version:
-                log.warning("Specified hadoop version (%s) does not match "
-                "job flow hadoop version (%s)" % (hadoop_version,
-                                              self._inferred_hadoop_version))
+            if (hadoop_version and
+                    hadoop_version != self._inferred_hadoop_version):
+                log.warning(
+                    "Specified hadoop version (%s) does not match"
+                    " job flow hadoop version (%s)" % (
+                        hadoop_version, self._inferred_hadoop_version))
         return self._inferred_hadoop_version
 
     def _address_of_master(self, emr_conn=None):

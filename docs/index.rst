@@ -15,70 +15,28 @@ To get started, install with ``pip``::
 
     pip install mrjob
 
-Guides
-======
+and begin reading the tutorial below.
 
-**Basics**
+.. ifconfig:: release.endswith('-dev')
 
-* :doc:`guides/quickstart`
-* :doc:`guides/concepts`
+    .. note::
 
-**Writing jobs**
-
-* :ref:`writing-basics`
-* :ref:`job-protocols`
-* :ref:`writing-protocols`
-* :ref:`writing-cl-opts`
-* :ref:`cmd-filters`
-* :ref:`cmd-steps`
-
-**Running jobs**
-
-* :doc:`guides/runners`
-* :ref:`runners-programmatically`
-* :doc:`guides/testing`
-
-**Configuration**
-
-* :doc:`guides/configs-basics`
-* :doc:`guides/configs-all-runners`
-* :doc:`guides/configs-hadoopy-runners`
-* :doc:`guides/configs-reference`
-
-**Cookbook**
-
-* :ref:`cookbook-src-tree-pythonpath`
-* :ref:`cookbook-task-timeout`
-* :ref:`cookbook-compressed-output`
-
-**Running jobs on Elastic MapReduce**
-
-* :ref:`amazon-setup`
-* :ref:`ssh-tunneling`
-* :ref:`running-an-emr-job`
-* :ref:`picking-job-flow-config`
-* :doc:`guides/emr-opts`
-* :doc:`guides/emr-tools`
-* :doc:`guides/cmd`
-* :doc:`guides/emr-troubleshooting`
-* :doc:`guides/emr-advanced`
-
-**Working on mrjob**
-
-* :doc:`guides/contributing`
-* :doc:`guides/runner-job-interactions`
-
-Reference
-=========
+        This documentation is for |release|, which is currently in
+        development. Documentation for the stable version of mrjob is hosted
+        at `http://pythonhosted.org/mrjob <http://pythonhosted.org/mrjob>`_.
 
 .. toctree::
-    :maxdepth: 2
+    :maxdepth: 3
 
-    whats-new.rst
-    reference.rst
     guides.rst
+    reference.rst
+    whats-new.rst
+    glossary.rst
 
-Indices and tables
-==================
+.. rubric:: Appendices
 
-* :ref:`search`
+:ref:`genindex`
+
+:ref:`modindex`
+
+:ref:`search`

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Copyright 2009-2012 Yelp and Contributors
+# Copyright 2009-2013 Yelp and Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,8 +23,10 @@ import copy
 from datetime import datetime
 from datetime import timedelta
 import getpass
+import itertools
 import logging
 import os
+import os.path
 import posixpath
 import py_compile
 import shutil
@@ -47,6 +49,7 @@ from mrjob.fs.s3 import S3Filesystem
 from mrjob.emr import EMRJobRunner
 from mrjob.emr import attempt_to_acquire_lock
 from mrjob.emr import describe_all_job_flows
+from mrjob.emr import _MAX_HOURS_IDLE_BOOTSTRAP_ACTION_PATH
 from mrjob.emr import _lock_acquire_step_1
 from mrjob.emr import _lock_acquire_step_2
 from mrjob.parse import JOB_NAME_RE
@@ -126,6 +129,8 @@ class FastEMRTestCase(SandboxedTestCase):
 
 class MockEMRAndS3TestCase(FastEMRTestCase):
 
+    MAX_SIMULATION_STEPS = 100
+
     def _mock_boto_connect_s3(self, *args, **kwargs):
         kwargs['mock_s3_fs'] = self.mock_s3_fs
         return MockS3Connection(*args, **kwargs)
@@ -135,6 +140,7 @@ class MockEMRAndS3TestCase(FastEMRTestCase):
         kwargs['mock_emr_job_flows'] = self.mock_emr_job_flows
         kwargs['mock_emr_failures'] = self.mock_emr_failures
         kwargs['mock_emr_output'] = self.mock_emr_output
+        kwargs['simulation_iterator'] = self.simulation_iterator
         return MockEmrConnection(*args, **kwargs)
 
     def setUp(self):
@@ -143,6 +149,8 @@ class MockEMRAndS3TestCase(FastEMRTestCase):
         self.mock_emr_job_flows = {}
         self.mock_emr_failures = {}
         self.mock_emr_output = {}
+        self.simulation_iterator = itertools.repeat(
+            None, self.MAX_SIMULATION_STEPS)
 
         p_s3 = patch.object(boto, 'connect_s3', self._mock_boto_connect_s3)
         self.addCleanup(p_s3.stop)
@@ -279,17 +287,20 @@ class EMRJobRunnerEndToEndTestCase(MockEMRAndS3TestCase):
 
             # make sure our input and output formats are attached to
             # the correct steps
-            self.assertIn('-inputformat', job_flow.steps[0].args())
-            self.assertNotIn('-outputformat', job_flow.steps[0].args())
-            self.assertNotIn('-inputformat', job_flow.steps[1].args())
-            self.assertIn('-outputformat', job_flow.steps[1].args())
+            step_0_args = [arg.value for arg in job_flow.steps[0].args]
+            step_1_args = [arg.value for arg in job_flow.steps[1].args]
+
+            self.assertIn('-inputformat', step_0_args)
+            self.assertNotIn('-outputformat', step_0_args)
+            self.assertNotIn('-inputformat', step_1_args)
+            self.assertIn('-outputformat', step_1_args)
 
             # make sure jobconf got through
-            self.assertIn('-D', job_flow.steps[0].args())
-            self.assertIn('x=y', job_flow.steps[0].args())
-            self.assertIn('-D', job_flow.steps[1].args())
+            self.assertIn('-D', step_0_args)
+            self.assertIn('x=y', step_0_args)
+            self.assertIn('-D', step_1_args)
             # job overrides jobconf in step 1
-            self.assertIn('x=z', job_flow.steps[1].args())
+            self.assertIn('x=z', step_1_args)
 
             # make sure mrjob.tar.gz is created and uploaded as
             # a bootstrap file
@@ -416,12 +427,11 @@ class EMRJobRunnerEndToEndTestCase(MockEMRAndS3TestCase):
 
         with mr_job.make_runner() as runner:
             runner.run()
-            self.assertNotIn('-files',
-                             runner._describe_jobflow().steps[0].args())
-            self.assertIn('-cacheFile',
-                          runner._describe_jobflow().steps[0].args())
-            self.assertNotIn('-combiner',
-                             runner._describe_jobflow().steps[0].args())
+            step_args = [arg.value for arg in
+                         runner._describe_jobflow().steps[0].args]
+            self.assertNotIn('-files', step_args)
+            self.assertIn('-cacheFile', step_args)
+            self.assertNotIn('-combiner', step_args)
 
     def test_args_version_020_205(self):
         self.add_mock_s3_data({'walrus': {'logs/j-MOCKJOBFLOW0/1': '1\n'}})
@@ -433,11 +443,11 @@ class EMRJobRunnerEndToEndTestCase(MockEMRAndS3TestCase):
 
         with mr_job.make_runner() as runner:
             runner.run()
-            self.assertIn('-files', runner._describe_jobflow().steps[0].args())
-            self.assertNotIn('-cacheFile',
-                             runner._describe_jobflow().steps[0].args())
-            self.assertIn('-combiner',
-                          runner._describe_jobflow().steps[0].args())
+            step_args = [arg.value for arg in
+                         runner._describe_jobflow().steps[0].args]
+            self.assertIn('-files', step_args)
+            self.assertNotIn('-cacheFile', step_args)
+            self.assertIn('-combiner', step_args)
 
     def test_wait_for_job_flow_termination(self):
         # Test regression from #338 where _wait_for_job_flow_termination
@@ -576,11 +586,11 @@ class VisibleToAllUsersTestCase(MockEMRAndS3TestCase):
 
     def test_defaults(self):
         job_flow = self.run_and_get_job_flow()
-        self.assertFalse(job_flow.visible_to_all_users)
+        self.assertEqual(job_flow.visibletoallusers, 'false')
 
     def test_visible(self):
         job_flow = self.run_and_get_job_flow('--visible-to-all-users')
-        self.assertTrue(job_flow.visible_to_all_users)
+        self.assertTrue(job_flow.visibletoallusers, 'true')
 
 
 class AMIAndHadoopVersionTestCase(MockEMRAndS3TestCase):
@@ -1659,6 +1669,13 @@ class TestEMRandS3Endpoints(MockEMRAndS3TestCase):
         self.assertEqual(runner.make_s3_conn().endpoint,
                          's3-eu-west-1.amazonaws.com')
 
+    def test_eu_case_insensitive(self):
+        runner = EMRJobRunner(conf_paths=[], aws_region='eu')
+        self.assertEqual(runner.make_emr_conn().endpoint,
+                         'elasticmapreduce.eu-west-1.amazonaws.com')
+        self.assertEqual(runner.make_s3_conn().endpoint,
+                         's3-eu-west-1.amazonaws.com')
+
     def test_us_east_1(self):
         runner = EMRJobRunner(conf_paths=[], aws_region='us-east-1')
         self.assertEqual(runner.make_emr_conn().endpoint,
@@ -1673,6 +1690,13 @@ class TestEMRandS3Endpoints(MockEMRAndS3TestCase):
         self.assertEqual(runner.make_s3_conn().endpoint,
                          's3-us-west-1.amazonaws.com')
 
+    def test_us_west_1_case_insensitive(self):
+        runner = EMRJobRunner(conf_paths=[], aws_region='US-West-1')
+        self.assertEqual(runner.make_emr_conn().endpoint,
+                         'elasticmapreduce.us-west-1.amazonaws.com')
+        self.assertEqual(runner.make_s3_conn().endpoint,
+                         's3-us-west-1.amazonaws.com')
+
     def test_ap_southeast_1(self):
         runner = EMRJobRunner(conf_paths=[], aws_region='ap-southeast-1')
         self.assertEqual(runner.make_emr_conn().endpoint,
@@ -1680,22 +1704,39 @@ class TestEMRandS3Endpoints(MockEMRAndS3TestCase):
         self.assertEqual(runner.make_s3_conn().endpoint,
                          's3-ap-southeast-1.amazonaws.com')
 
-    def test_bad_region(self):
-        # should fail in the constructor because the constructor connects to S3
-        self.assertRaises(Exception, EMRJobRunner,
-                          conf_paths=[], aws_region='the-moooooooon-1')
-
-    def test_case_sensitive(self):
-        self.assertRaises(Exception, EMRJobRunner,
-                          conf_paths=[], aws_region='eu')
-        self.assertRaises(Exception, EMRJobRunner,
-                          conf_paths=[], aws_region='US-WEST-1')
+    def test_previously_unknown_region(self):
+        runner = EMRJobRunner(conf_paths=[], aws_region='lolcatnia-1')
+        self.assertEqual(runner.make_emr_conn().endpoint,
+                         'elasticmapreduce.lolcatnia-1.amazonaws.com')
+        self.assertEqual(runner.make_s3_conn().endpoint,
+                         's3-lolcatnia-1.amazonaws.com')
 
     def test_explicit_endpoints(self):
         runner = EMRJobRunner(conf_paths=[], aws_region='EU',
                               s3_endpoint='s3-proxy', emr_endpoint='emr-proxy')
         self.assertEqual(runner.make_emr_conn().endpoint, 'emr-proxy')
         self.assertEqual(runner.make_s3_conn().endpoint, 's3-proxy')
+
+    def test_ssl_fallback_host(self):
+        runner = EMRJobRunner(conf_paths=[], aws_region='us-west-1')
+
+        with patch.object(MockEmrConnection, 'STRICT_SSL', True):
+            emr_conn = runner.make_emr_conn()
+            self.assertEqual(emr_conn.endpoint,
+                             'elasticmapreduce.us-west-1.amazonaws.com')
+            # this should still work
+            self.assertEqual(emr_conn.describe_jobflows(), [])
+            # but it's only because we've switched to the alternate hostname
+            self.assertEqual(emr_conn.endpoint,
+                             'us-west-1.elasticmapreduce.amazonaws.com')
+
+        # without SSL issues, we should stay on the same endpoint
+        emr_conn = runner.make_emr_conn()
+        self.assertEqual(emr_conn.endpoint,
+                         'elasticmapreduce.us-west-1.amazonaws.com')
+        self.assertEqual(emr_conn.describe_jobflows(), [])
+        self.assertEqual(emr_conn.endpoint,
+                         'elasticmapreduce.us-west-1.amazonaws.com')
 
 
 class TestS3Ls(MockEMRAndS3TestCase):
@@ -2352,20 +2393,40 @@ class PoolMatchingTestCase(MockEMRAndS3TestCase):
             '--pool-name', 'pool1'],
             job_class=MRWordCount)
 
-    def test_dont_join_idle_with_steps(self):
-        dummy_runner, job_flow_id = self.make_pooled_job_flow('pool1')
+    def test_dont_join_idle_with_pending_steps(self):
+        dummy_runner, job_flow_id = self.make_pooled_job_flow()
 
         self.mock_emr_job_flows[job_flow_id].steps = [
             MockEmrObject(
-                state='WAITING',
+                state='PENDING',
+                mock_no_progress=True,
                 name='dummy',
                 actiononfailure='CANCEL_AND_WAIT',
                 args=[])]
 
-        self.assertDoesNotJoin(job_flow_id, [
-            '-r', 'emr', '-v', '--pool-emr-job-flows',
-            '--pool-name', 'pool1'],
-            job_class=MRWordCount)
+        self.assertDoesNotJoin(job_flow_id,
+                               ['-r', 'emr', '--pool-emr-job-flows'])
+
+    def test_do_join_idle_with_cancelled_steps(self):
+        dummy_runner, job_flow_id = self.make_pooled_job_flow()
+
+        self.mock_emr_job_flows[job_flow_id].steps = [
+            MockEmrObject(
+                state='FAILED',
+                name='step 1 of 2',
+                actiononfailure='CANCEL_AND_WAIT',
+                enddatetime='sometime in the past',
+                args=[]),
+            # step 2 never ran, so its enddatetime is not set
+            MockEmrObject(
+                state='CANCELLED',
+                name='step 2 of 2',
+                actiononfailure='CANCEL_AND_WAIT',
+                args=[])
+        ]
+
+        self.assertJoins(job_flow_id,
+                         ['-r', 'emr', '--pool-emr-job-flows'])
 
     def test_dont_join_wrong_named_pool(self):
         _, job_flow_id = self.make_pooled_job_flow('pool1')
@@ -2546,6 +2607,19 @@ class PoolMatchingTestCase(MockEMRAndS3TestCase):
         job_flow = emr_conn.describe_jobflow(job_flow_id)
         self.assertEqual(job_flow.state, 'WAITING')
 
+    def test_max_hours_idle_doesnt_affect_pool_hash(self):
+        # max_hours_idle uses a bootstrap action, but it's not included
+        # in the pool hash
+        _, job_flow_id = self.make_pooled_job_flow()
+
+        self.assertJoins(job_flow_id, [
+            '-r', 'emr', '--pool-emr-job-flows', '--max-hours-idle', '1'])
+
+    def test_can_join_job_flow_started_with_max_hours_idle(self):
+        _, job_flow_id = self.make_pooled_job_flow(max_hours_idle=1)
+
+        self.assertJoins(job_flow_id, ['-r', 'emr', '--pool-emr-job-flows'])
+
 
 class PoolingDisablingTestCase(MockEMRAndS3TestCase):
 
@@ -2629,6 +2703,89 @@ class S3LockTestCase(MockEMRAndS3TestCase):
 
         self.assertFalse(_lock_acquire_step_2(key, 'jf1'), 'Lock should fail')
 
+
+class MaxHoursIdleTestCase(MockEMRAndS3TestCase):
+
+    def assertRanIdleTimeoutScriptWith(self, runner, args):
+        emr_conn = runner.make_emr_conn()
+        job_flow = emr_conn.describe_jobflow(runner.get_emr_job_flow_id())
+        action = job_flow.bootstrapactions[-1]
+        self.assertEqual(action.name, 'idle timeout')
+        self.assertEqual(
+            action.path,
+            runner._upload_mgr.uri(_MAX_HOURS_IDLE_BOOTSTRAP_ACTION_PATH))
+        self.assertEqual([arg.value for arg in action.args], args)
+
+    def assertDidNotUseIdleTimeoutScript(self, runner):
+        emr_conn = runner.make_emr_conn()
+        job_flow = emr_conn.describe_jobflow(runner.get_emr_job_flow_id())
+        action_names = [ba.name for ba in job_flow.bootstrapactions]
+        self.assertNotIn('idle timeout', action_names)
+        # idle timeout script should not even be uploaded
+        self.assertNotIn(_MAX_HOURS_IDLE_BOOTSTRAP_ACTION_PATH,
+                         runner._upload_mgr.path_to_uri())
+
+    def test_default(self):
+        mr_job = MRWordCount(['-r', 'emr'])
+        mr_job.sandbox()
+
+        with mr_job.make_runner() as runner:
+            runner.run()
+            self.assertDidNotUseIdleTimeoutScript(runner)
+
+    def test_non_persistent_job_flow(self):
+        mr_job = MRWordCount(['-r', 'emr', '--max-hours-idle', '1'])
+        mr_job.sandbox()
+
+        with mr_job.make_runner() as runner:
+            runner.run()
+            self.assertDidNotUseIdleTimeoutScript(runner)
+
+    def test_persistent_job_flow(self):
+        mr_job = MRWordCount(['-r', 'emr', '--max-hours-idle', '0.01'])
+        mr_job.sandbox()
+
+        with mr_job.make_runner() as runner:
+            runner.make_persistent_job_flow()
+            self.assertRanIdleTimeoutScriptWith(runner, ['36', '300'])
+
+    def test_mins_to_end_of_hour(self):
+        mr_job = MRWordCount(['-r', 'emr', '--max-hours-idle', '1',
+                              '--mins-to-end-of-hour', '10'])
+        mr_job.sandbox()
+
+        with mr_job.make_runner() as runner:
+            runner.make_persistent_job_flow()
+            self.assertRanIdleTimeoutScriptWith(runner, ['3600', '600'])
+
+    def test_mins_to_end_of_hour_does_nothing_without_max_hours_idle(self):
+        mr_job = MRWordCount(['-r', 'emr', '--mins-to-end-of-hour', '10'])
+        mr_job.sandbox()
+
+        with mr_job.make_runner() as runner:
+            runner.make_persistent_job_flow()
+            self.assertDidNotUseIdleTimeoutScript(runner)
+
+    def test_use_integers(self):
+        mr_job = MRWordCount(['-r', 'emr', '--max-hours-idle', '1.000001',
+                              '--mins-to-end-of-hour', '10.000001'])
+        mr_job.sandbox()
+
+        with mr_job.make_runner() as runner:
+            runner.make_persistent_job_flow()
+            self.assertRanIdleTimeoutScriptWith(runner, ['3600', '600'])
+
+    def pooled_job_flows(self):
+        mr_job = MRWordCount(['-r', 'emr', '--pool-emr-job-flows',
+                              '--max-hours-idle', '0.5'])
+        mr_job.sandbox()
+
+        with mr_job.make_runner() as runner:
+            runner.run()
+            self.assertRanIdleTimeoutScriptWith(runner, ['1800', '300'])
+
+    def test_bootstrap_script_is_actually_installed(self):
+        self.assertTrue(os.path.exists(_MAX_HOURS_IDLE_BOOTSTRAP_ACTION_PATH))
 
 class TestCatFallback(MockEMRAndS3TestCase):
 
@@ -2907,8 +3064,9 @@ class BuildStreamingStepTestCase(FastEMRTestCase):
         self.simple_patch(boto.emr, 'StreamingStep', dict)
         self.runner._inferred_hadoop_version = '0.20'
 
-    def _assert_streaming_step(self, step, step_num=0, num_steps=1, **kwargs):
-        d = self.runner._build_streaming_step(step, step_num, num_steps)
+    def _assert_streaming_step(self, step, **kwargs):
+        self.runner._steps = [step]
+        d = self.runner._build_streaming_step(0)
         for k, v in kwargs.iteritems():
             self.assertEqual(d[k], v)
 
