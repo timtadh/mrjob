@@ -46,6 +46,12 @@ class JarStepTestCase(TestCase):
         }
         expected = kwargs.copy()
         expected['type'] = 'jar'
+        expected['io'] = {
+           'input_format': '%s',
+           'input_marker': '<<INPUT>>',
+           'output_format': '%s',
+           'output_marker': '<<OUTPUT>>',
+        }
         self.assertEqual(JarStep(**kwargs).description(0), expected)
 
     def test_some(self):
@@ -59,6 +65,12 @@ class JarStepTestCase(TestCase):
             'main_class': None,
             'step_args': None,
         })
+        expected['io'] = {
+           'input_format': '%s',
+           'input_marker': '<<INPUT>>',
+           'output_format': '%s',
+           'output_marker': '<<OUTPUT>>',
+        }
         self.assertEqual(JarStep(**kwargs).description(0), expected)
 
 
