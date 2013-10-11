@@ -1358,16 +1358,17 @@ class EMRJobRunner(MRJobRunner):
 
         return boto.emr.StreamingStep(**streaming_step_kwargs)
 
-    def _build_jar_step(self, step, step_num, num_steps):
+    def _build_jar_step(self, step_num):
         input_paths = self._s3_step_input_uris(step_num)
         output_path = self._s3_step_output_uri(step_num)
+        step = self._get_step(step_num)
         step_args = step['step_args']
         io = step['io']
 
         ## The input_marker specifies where in the command
         ## the input files should be specified. The input_format
         ## specifies the way it should be formated. If there are spaces
-        ## in the format it is assumed that they should be viewed as seperate 
+        ## in the format it is assumed that they should be viewed as seperate
         ## shell arguments.
         ## The same is true for the output specification.
         if io['input_marker'] in step_args:
@@ -1395,7 +1396,7 @@ class EMRJobRunner(MRJobRunner):
 
         return boto.emr.JarStep(
             name='%s: Step %d of %d' % (
-                self._job_name, step_num + 1, num_steps),
+                self._job_name, step_num + 1, self._num_steps()),
             jar=self._upload_mgr.uri(step['jar']),
             main_class=step['main_class'],
             step_args=step_args,
