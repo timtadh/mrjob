@@ -31,12 +31,16 @@ from mrjob.util import cmd_line
 from mrjob.util import read_file
 
 
-log = logging.getLogger('mrjob.fs.hadoop')
+log = logging.getLogger(__name__)
 
 # used by mkdir()
 HADOOP_FILE_EXISTS_RE = re.compile(r'.*File exists.*')
 
-# used by ls()
+# used by ls() and path_exists()
+_HADOOP_LS_NO_SUCH_FILE = re.compile(
+    r'^lsr?: Cannot access .*: No such file or directory.')
+
+# Deprecated: removing this in v0.5 and prepending _ to the other constants
 HADOOP_LSR_NO_SUCH_FILE = re.compile(
     r'^lsr: Cannot access .*: No such file or directory.')
 
@@ -59,7 +63,7 @@ class HadoopFilesystem(Filesystem):
         return is_uri(path)
 
     def invoke_hadoop(self, args, ok_returncodes=None, ok_stderr=None,
-                       return_stdout=False):
+                      return_stdout=False):
         """Run the given hadoop command, raising an exception on non-zero
         return code. This only works for commands whose output we don't
         care about.
@@ -133,7 +137,7 @@ class HadoopFilesystem(Filesystem):
             stdout = self.invoke_hadoop(
                 ['fs', '-lsr', path_glob],
                 return_stdout=True,
-                ok_stderr=[HADOOP_LSR_NO_SUCH_FILE])
+                ok_stderr=[_HADOOP_LS_NO_SUCH_FILE])
         except CalledProcessError:
             raise IOError("Could not ls %s" % path_glob)
 
@@ -171,10 +175,7 @@ class HadoopFilesystem(Filesystem):
 
         cat_proc = Popen(cat_args, stdout=PIPE, stderr=PIPE)
 
-        def stream():
-            for line in cat_proc.stdout:
-                yield line
-
+        def cleanup():
             # there shouldn't be any stderr
             for line in cat_proc.stderr:
                 log.error('STDERR: ' + line)
@@ -184,7 +185,7 @@ class HadoopFilesystem(Filesystem):
             if returncode != 0:
                 raise IOError("Could not stream %s" % filename)
 
-        return read_file(filename, stream())
+        return read_file(filename, cat_proc.stdout, cleanup=cleanup)
 
     def mkdir(self, path):
         try:
@@ -200,8 +201,11 @@ class HadoopFilesystem(Filesystem):
         any files starting with that path.
         """
         try:
-            return_code = self.invoke_hadoop(['fs', '-ls', path_glob],
-                                             ok_returncodes=[0,-1,255])
+            return_code = self.invoke_hadoop(
+                ['fs', '-ls', path_glob],
+                ok_returncodes=[0, -1, 255],
+                ok_stderr=[_HADOOP_LS_NO_SUCH_FILE])
+
             return (return_code == 0)
         except CalledProcessError:
             raise IOError("Could not check path %s" % path_glob)

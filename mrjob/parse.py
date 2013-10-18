@@ -37,7 +37,7 @@ JOB_NAME_RE = re.compile(r'^(.*)\.(.*)\.(\d+)\.(\d+)\.(\d+)$')
 STEP_NAME_RE = re.compile(
     r'^(.*)\.(.*)\.(\d+)\.(\d+)\.(\d+): Step (\d+) of (\d+)$')
 
-log = logging.getLogger('mrjob.parse')
+log = logging.getLogger(__name__)
 
 
 ### URI PARSING ###
@@ -72,7 +72,7 @@ def parse_s3_uri(uri):
     """
     components = urlparse(uri)
     if (components.scheme not in ('s3', 's3n')
-        or '/' not in components.path):
+            or '/' not in components.path):
         raise ValueError('Invalid S3 URI: %s' % uri)
 
     return components.netloc, components.path[1:]
@@ -100,7 +100,7 @@ def urlparse(urlstring, scheme='', allow_fragments=True, *args, **kwargs):
     if netloc == '' and path.startswith('//'):
         m = NETLOC_RE.match(path)
         netloc = m.group(1)
-        path = m.group(1)
+        path = m.group(2)
     if allow_fragments and '#' in path and not fragment:
         path, fragment = path.split('#', 1)
     return ParseResult(scheme, netloc, path, params, query, fragment)
@@ -287,8 +287,9 @@ def find_interesting_hadoop_streaming_error(lines):
         2010-07-27 19:53:35,451 ERROR org.apache.hadoop.streaming.StreamJob (main): Error launching job , Output path already exists : Output directory s3://yourbucket/logs/2010/07/23/ already exists and is not empty
     """
     for line in lines:
-        match = _HADOOP_STREAMING_ERROR_RE.match(line) \
-                or _HADOOP_STREAMING_ERROR_RE_2.match(line)
+        match = (
+            _HADOOP_STREAMING_ERROR_RE.match(line) or
+            _HADOOP_STREAMING_ERROR_RE_2.match(line))
         if match:
             msg = match.group(1)
             if msg != 'Job not Successful!':

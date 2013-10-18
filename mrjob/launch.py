@@ -45,7 +45,7 @@ from mrjob.util import log_to_stream
 from mrjob.util import parse_and_save_options
 
 
-log = logging.getLogger('mrjob.run')
+log = logging.getLogger(__name__)
 
 
 # sentinel value; used when running MRJob as a script
@@ -450,7 +450,7 @@ class MRJobLauncher(object):
                 else:
                     self.option_parser.error(cleanup_error % choice)
             if ('NONE' in new_cleanup_options and
-                len(set(new_cleanup_options)) > 1):
+                    len(set(new_cleanup_options)) > 1):
                 self.option_parser.error(
                     'Cannot clean up both nothing and something!')
             return new_cleanup_options
@@ -594,8 +594,8 @@ class MRJobLauncher(object):
         arg_map = parse_and_save_options(self.option_parser, self._cl_args)
         output_args = []
 
-        passthrough_dests = sorted(set(option.dest for option \
-                                       in self._passthrough_options))
+        passthrough_dests = sorted(
+            set(option.dest for option in self._passthrough_options))
         for option_dest in passthrough_dests:
             output_args.extend(arg_map.get(option_dest, []))
 

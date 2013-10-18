@@ -573,7 +573,7 @@ class JobConfTestCase(unittest.TestCase):
     def test_float_options_3(self):
         self.assert_hadoop_version(self.MRHadoopVersionJobConfJob3, '0.20')
 
-    def test_jobconf_attr(self):
+    def test_jobconf_method(self):
         mr_job = self.MRJobConfJob()
 
         self.assertEqual(mr_job.job_runner_kwargs()['jobconf'],
@@ -611,6 +611,10 @@ class JobConfTestCase(unittest.TestCase):
 
 class MRSortValuesJob(MRJob):
     SORT_VALUES = True
+
+    # need to define a mapper or reducer
+    def mapper_init(self):
+        pass
 
 
 class MRSortValuesAndMoreJob(MRSortValuesJob):
@@ -677,17 +681,17 @@ class SortValuesTestCase(unittest.TestCase):
 
 class SortValuesRunnerTestCase(SandboxedTestCase):
 
-    MRJOB_CONF_CONTENTS = {'runners': {'local': {'jobconf': {
+    MRJOB_CONF_CONTENTS = {'runners': {'inline': {'jobconf': {
         'mapred.text.key.partitioner.options': '-k1,1',
         'mapred.output.key.comparator.class': 'egypt.god.Anubis',
         'foo': 'bar',
     }}}}
 
     def test_cant_override_sort_values_from_mrjob_conf(self):
-        runner = MRSortValuesJob(['-r', 'local']).make_runner()
+        runner = MRSortValuesJob().make_runner()
 
         self.assertEqual(
-            runner._hadoop_conf_args({}, 0, 1),
+            runner._hadoop_args_for_step(0),
             # foo=bar is included, but the other options from mrjob.conf are
             # blanked out so as not to mess up SORT_VALUES
             ['-D', 'foo=bar',
@@ -1020,6 +1024,13 @@ class StepsTestCase(unittest.TestCase):
         def reducer_cmd(self):
             return 'wc -l'
 
+    class SingleStepJobConfMethodJob(MRJob):
+        def mapper(self, key, value):
+            return None
+
+        def jobconf(self):
+            return {'mapred.baz': 'bar'}
+
     def test_steps(self):
         j = self.SteppyJob(['--no-conf'])
         self.assertEqual(
@@ -1040,3 +1051,16 @@ class StepsTestCase(unittest.TestCase):
                 'mapper': {'type': 'command', 'command': 'cat'},
                 'combiner': {'type': 'command', 'command': 'cat'},
                 'reducer': {'type': 'command', 'command': 'wc -l'}}])
+
+    def test_can_override_jobconf_method(self):
+        # regression test for #656
+        j = self.SingleStepJobConfMethodJob(['--no-conf'])
+
+        # overriding jobconf() should affect job_runner_kwargs()
+        # but not step definitions
+        self.assertEqual(j.job_runner_kwargs()['jobconf'],
+                         {'mapred.baz': 'bar'})
+
+        self.assertEqual(
+            j.steps()[0],
+            MRJobStep(mapper=j.mapper))

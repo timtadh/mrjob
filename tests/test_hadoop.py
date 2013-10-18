@@ -1,4 +1,5 @@
 # Copyright 2009-2012 Yelp
+# Copyright 2013 David Marin
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +21,7 @@ from StringIO import StringIO
 import getpass
 import os
 import pty
+from subprocess import CalledProcessError
 from subprocess import check_call
 
 from mock import patch
@@ -38,7 +40,9 @@ from mrjob.util import shlex_split
 
 from tests.mockhadoop import create_mock_hadoop_script
 from tests.mockhadoop import add_mock_hadoop_output
+from tests.mr_just_a_jar import MRJustAJar
 from tests.mr_two_step_hadoop_format_job import MRTwoStepJob
+from tests.quiet import logger_disabled
 from tests.sandbox import EmptyMrjobConfTestCase
 from tests.sandbox import SandboxedTestCase
 
@@ -254,7 +258,7 @@ class HadoopJobRunnerEndToEndTestCase(MockHadoopTestCase):
             self._test_end_to_end()
 
     def test_end_to_end_with_disabled_input_path_check(self):
-        self._test_end_to_end(['--skip-hadoop-input-check'])
+        self._test_end_to_end(['--no-check-input-paths'])
 
 
 class StreamingArgsTestCase(EmptyMrjobConfTestCase):
@@ -276,8 +280,8 @@ class StreamingArgsTestCase(EmptyMrjobConfTestCase):
                           return_value=['new_upload_args'])
         self.simple_patch(self.runner, '_old_upload_args',
                           return_value=['old_upload_args'])
-        self.simple_patch(self.runner, '_hadoop_conf_args',
-                          return_value=['hadoop_conf_args'])
+        self.simple_patch(self.runner, '_hadoop_args_for_step',
+                          return_value=['hadoop_args_for_step'])
         self.simple_patch(self.runner, '_hdfs_step_input_files',
                           return_value=['hdfs_step_input_files'])
         self.simple_patch(self.runner, '_hdfs_step_output_dir',
@@ -286,13 +290,13 @@ class StreamingArgsTestCase(EmptyMrjobConfTestCase):
 
         self._new_basic_args = [
             'hadoop', 'jar', 'streaming.jar',
-             'new_upload_args', 'hadoop_conf_args',
+             'new_upload_args', 'hadoop_args_for_step',
              '-input', 'hdfs_step_input_files',
              '-output', 'hdfs_step_output_dir']
 
         self._old_basic_args = [
             'hadoop', 'jar', 'streaming.jar',
-             'hadoop_conf_args',
+             'hadoop_args_for_step',
              '-input', 'hdfs_step_input_files',
              '-output', 'hdfs_step_output_dir',
              'old_upload_args']
@@ -303,16 +307,18 @@ class StreamingArgsTestCase(EmptyMrjobConfTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _assert_streaming_step(self, step, args, step_num=0, num_steps=1):
+    def _assert_streaming_step(self, step, args):
+        self.runner._steps = [step]
         self.assertEqual(
-            self.runner._streaming_args(step, step_num, num_steps),
+            self.runner._args_for_streaming_step(0),
             self._new_basic_args + args)
 
-    def _assert_streaming_step_old(self, step, args, step_num=0, num_steps=1):
+    def _assert_streaming_step_old(self, step, args):
         self.runner._hadoop_version = '0.18'
+        self.runner._steps = [step]
         self.assertEqual(
-            self._old_basic_args + args,
-            self.runner._streaming_args(step, step_num, num_steps))
+            self.runner._args_for_streaming_step(0),
+            self._old_basic_args + args)
 
     def test_basic_mapper(self):
         self._assert_streaming_step(
@@ -420,3 +426,60 @@ class StreamingArgsTestCase(EmptyMrjobConfTestCase):
                  " '\\''\\'\\'''\\''anything'\\''\\'\\'''\\'''\\'' |"
                  " python my_job.py --step-num=0 --mapper'",
              '-jobconf', 'mapred.reduce.tasks=0'])
+
+
+class JarStepTestCase(MockHadoopTestCase):
+
+    def test_local_jar(self):
+        fake_jar = os.path.join(self.tmp_dir, 'fake.jar')
+        open(fake_jar, 'w').close()
+
+        job = MRJustAJar(['-r', 'hadoop', '--jar', fake_jar])
+        job.sandbox()
+
+        with job.make_runner() as runner:
+            runner.run()
+
+        with open(os.environ['MOCK_HADOOP_LOG']) as hadoop_log:
+            hadoop_jar_lines = [line for line in hadoop_log
+                                if line.startswith('jar ')]
+            self.assertEqual(len(hadoop_jar_lines), 1)
+            self.assertEqual(hadoop_jar_lines[0].rstrip(), 'jar ' + fake_jar)
+
+    def test_hdfs_jar_uri(self):
+        # this could change, but for now, we pass URIs straight through
+        mock_hdfs_jar = os.path.join(os.environ['MOCK_HDFS_ROOT'], 'fake.jar')
+        open(mock_hdfs_jar, 'w').close()
+
+        jar_uri = 'hdfs:///fake.jar'
+
+        job = MRJustAJar(['-r', 'hadoop', '--jar', jar_uri])
+        job.sandbox()
+
+        with job.make_runner() as runner:
+            with logger_disabled('mrjob.hadoop'):
+                # `hadoop jar` doesn't actually accept URIs
+                self.assertRaises(CalledProcessError, runner.run)
+
+        with open(os.environ['MOCK_HADOOP_LOG']) as hadoop_log:
+            hadoop_jar_lines = [line for line in hadoop_log
+                                if line.startswith('jar ')]
+            self.assertEqual(len(hadoop_jar_lines), 1)
+            self.assertEqual(hadoop_jar_lines[0].rstrip(), 'jar ' + jar_uri)
+
+    def test_file_jar_uri(self):
+        fake_jar = os.path.join(self.tmp_dir, 'fake.jar')
+        open(fake_jar, 'w').close()
+        jar_uri = 'file://' + fake_jar
+
+        job = MRJustAJar(['-r', 'hadoop', '--jar', jar_uri])
+        job.sandbox()
+
+        with job.make_runner() as runner:
+            runner.run()
+
+        with open(os.environ['MOCK_HADOOP_LOG']) as hadoop_log:
+            hadoop_jar_lines = [line for line in hadoop_log
+                                if line.startswith('jar ')]
+            self.assertEqual(len(hadoop_jar_lines), 1)
+            self.assertEqual(hadoop_jar_lines[0].rstrip(), 'jar ' + fake_jar)

@@ -48,9 +48,17 @@ a new job flow will be created that does not terminate when the job completes.
 When you use :option:`--pool-emr-job-flows` the next time, it will identify the
 job flow and add the job to it rather than creating a new one.
 
-**If you use job flow pools, keep**
-:py:mod:`~mrjob.tools.emr.terminate_idle_job_flows` **in your crontab!**
-Otherwise you will forget to terminate your job flows and waste a lot of money.
+.. warning::
+
+    If you use job flow pools, keep
+    :py:mod:`~mrjob.tools.emr.terminate_idle_job_flows` in your crontab!
+    Otherwise you may forget to terminate your job flows and waste a lot of
+    money.
+
+Alternatively, you may use the :mrjob-opt:`max_hours_idle` option to create
+self-terminating job flows; the disadvantage is that pooled jobs may
+occasionally join job flows with out knowing they are about to self-terminate
+(this is better for development than production).
 
 Pooling is designed so that jobs run against the same :py:mod:`mrjob.conf` can
 share the same job flows. This means that the version of :py:mod:`mrjob`,
@@ -159,25 +167,16 @@ number of mappers and reducers to one per node::
     -m mapred.tasktracker.map.tasks.maximum=1 \
     -m mapred.tasktracker.reduce.tasks.maximum=1"
 
-.. _visible_to_all_users:
-
-Making Job Flows Visible To All Users
--------------------------------------
-
-You can make job flow visible to all IAM users with the :option:`--visible-to-all-users`.
-If you won't specify this option created job flow will be visible only for IAM user that
-created the job flow. 
-
 Setting up Ganglia
 ------------------
 
-`Ganglia <http://www.ganglia.info>`_` is a scalable distributed monitoring
+`Ganglia <http://www.ganglia.info>`_ is a scalable distributed monitoring
 system for high-performance computing systems. You can enable it for your
 EMR cluster with Amazon's `install-ganglia`_ bootstrap action::
 
     --bootstrap-action="s3://elasticmapreduce/bootstrap-actions/install-ganglia
 
-.. _install-ganglia: http://docs.amazonwebservices.com/ElasticMapReduce/latest/DeveloperGuide/index.html?init_Ganglia.html
+.. _install-ganglia: http://docs.aws.amazon.com/ElasticMapReduce/latest/DeveloperGuide/UsingEMR_Ganglia.html
 
 Enabling Python core dumps
 --------------------------

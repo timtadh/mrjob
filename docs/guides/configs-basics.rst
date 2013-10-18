@@ -9,15 +9,6 @@ We look for :file:`mrjob.conf` in these locations:
 - :file:`~/.mrjob.conf`
 - :file:`/etc/mrjob.conf`
 
-If your :file:`mrjob.conf` path is deprecated, use this table to fix it:
-
-================================= ===============================
-Old Location                      New Location
-================================= ===============================
-:file:`~/.mrjob`                  :file:`~/.mrjob.conf`
-somewhere in :envvar:`PYTHONPATH` Specify in :envvar:`MRJOB_CONF`
-================================= ===============================
-
 You can specify one or more configuration files with the :option:`--conf-path`
 flag. See :doc:`configs-all-runners` for more information.
 
@@ -228,7 +219,7 @@ accomplish this, use the ``include`` option:
     runners:
         emr:
             num_ec2_core_instances: 20
-            ec2_core_instace_type: m1.xlarge
+            ec2_core_instance_type: m1.xlarge
 
 :file:`~/mrjob.very-small.conf`:
 
@@ -238,7 +229,7 @@ accomplish this, use the ``include`` option:
     runners:
         emr:
             num_ec2_core_instances: 2
-            ec2_core_instace_type: m1.small
+            ec2_core_instance_type: m1.small
 
 :file:`~/.mrjob.base.conf`:
 

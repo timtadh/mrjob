@@ -46,11 +46,11 @@ from mrjob.launch import MRJobLauncher
 from mrjob.launch import _READ_ARGS_FROM_SYS_ARGV
 from mrjob.step import JarStep
 from mrjob.step import MRJobStep
-from mrjob.step import _JOB_STEP_PARAMS
+from mrjob.step import _JOB_STEP_FUNC_PARAMS
 from mrjob.util import read_input
 
 
-log = logging.getLogger('mrjob.job')
+log = logging.getLogger(__name__)
 
 
 # jobconf options for implementing SORT_VALUES
@@ -331,7 +331,7 @@ class MRJob(MRJobLauncher):
         """
         # Use mapper(), reducer() etc. only if they've been re-defined
         kwargs = dict((func_name, getattr(self, func_name))
-                      for func_name in _JOB_STEP_PARAMS
+                      for func_name in _JOB_STEP_FUNC_PARAMS
                       if (getattr(self, func_name).im_func is not
                           getattr(MRJob, func_name).im_func))
 
@@ -738,8 +738,8 @@ class MRJob(MRJobLauncher):
                     if self.options.strict_protocols:
                         raise
                     else:
-                        self.increment_counter('Undecodable input',
-                                                e.__class__.__name__)
+                        self.increment_counter(
+                            'Undecodable input', e.__class__.__name__)
 
         def write_line(key, value):
             try:
@@ -748,8 +748,8 @@ class MRJob(MRJobLauncher):
                 if self.options.strict_protocols:
                     raise
                 else:
-                    self.increment_counter('Unencodable output',
-                                            e.__class__.__name__)
+                    self.increment_counter(
+                        'Unencodable output', e.__class__.__name__)
 
         return read_lines, write_line
 
@@ -904,9 +904,9 @@ class MRJob(MRJobLauncher):
         This is mostly useful inside :py:meth:`load_options`, to disable
         loading options when we aren't running inside Hadoop Streaming.
         """
-        return self.options.run_mapper \
-                or self.options.run_combiner \
-                or self.options.run_reducer
+        return (self.options.run_mapper or
+                self.options.run_combiner or
+                self.options.run_reducer)
 
     def _process_args(self, args):
         """mrjob.launch takes the first arg as the script path, but mrjob.job
@@ -1148,7 +1148,7 @@ class MRJob(MRJobLauncher):
 
             # hadoop_version should be a string
             elif (key == 'hadoop_version' and
-                isinstance(unfiltered_val, float)):
+                    isinstance(unfiltered_val, float)):
                 log.warn('hadoop_version should be a string, not %s' %
                          unfiltered_val)
                 filtered_val = format_hadoop_version(unfiltered_val)
@@ -1180,6 +1180,8 @@ class MRJob(MRJobLauncher):
     #:
     #: See :py:meth:`jobconf()` and :py:meth:`partitioner()` for more about
     #: how this works.
+    #:
+    #: .. versionadded:: 0.4.1
     SORT_VALUES = None
 
     ### Testing ###

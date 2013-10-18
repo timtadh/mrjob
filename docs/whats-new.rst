@@ -4,13 +4,63 @@ What's New
 For a complete list of changes, see `CHANGES.txt
 <https://github.com/Yelp/mrjob/blob/master/CHANGES.txt>`_
 
+0.4.1
+-----
+
+The :py:attr:`~mrjob.job.MRJob.SORT_VALUES` option enables secondary sort,
+ensuring that your reducer(s) receive values in sorted order. This allows you
+to do things with reducers that would otherwise involve storing all the values
+in memory, such as:
+
+* Receiving a grand total before any subtotals, so you can calculate
+  percentages on the fly. See `mr_next_word_stats.py
+  <https://github.com/Yelp/mrjob/blob/master/mrjob/examples/mr_next_word_stats.py>`_ for an example.
+* Running a window of fixed length over an arbitrary amount of sorted
+  values (e.g. a 24-hour window over timestamped log data).
+
+The :mrjob-opt:`max_hours_idle` option allows you to spin up EMR job flows
+that will terminate themselves after being idle for a certain amount of time,
+in a way that optimizes EMR/EC2's full-hour billing model.
+
+For development (not production), we now recommend always using
+:ref:`job flow pooling <pooling-job-flows>`, with :mrjob-opt:`max_hours_idle`
+enabled. Update your :ref:`mrjob.conf <mrjob.conf>` like this:
+
+.. code-block:: yaml
+
+    runners:
+      emr:
+        max_hours_idle: 0.25
+	pool_emr_job_flows: true
+
+.. warning::
+
+   If you enable pooling *without* :mrjob-opt:`max_hours_idle` (or
+   cronning :py:mod:`~mrjob.tools.emr.terminate_idle_job_flows`), pooled job
+   flows will stay active forever, costing you money!
+
+You can now use :option:`--no-check-input-paths` with the Hadoop runner to
+allow jobs to run even if ``hadoop fs -ls`` can't see their input files
+(see :mrjob-opt:`check_input_paths`).
+
+Two bits of straggling deprecated functionality were removed:
+
+* Built-in :ref:`protocols <job-protocols>` must be instantiated
+  to be used (formerly they had class methods).
+* Old locations for :ref:`mrjob.conf <mrjob.conf>` are no longer supported.
+
+This version also contains numerous bugfixes and natural extensions of
+existing functionality; many more things will now Just Work (see `CHANGES.txt
+<https://github.com/Yelp/mrjob/blob/master/CHANGES.txt>`_).
+
 0.4.0
 -----
 The default runner is now `inline` instead of `local`. This change will speed
 up debugging for many users. Use `local` if you need to simulate more features
 of Hadoop.
 
-The EMR tools can now be accessed more easily via the `mrjob` command. Learn more [here].
+The EMR tools can now be accessed more easily via the `mrjob` command. Learn
+more :doc:`here <guides/cmd>`.
 
 Job steps are much richer now:
 
@@ -179,7 +229,7 @@ Changes and Deprecations
 
     In addition to :option:`--jobconf`, you can now set jobconf values with the
     :py:attr:`.JOBCONF` attribute or the :py:meth:`.jobconf()` method.  To read
-    jobconf values back, use :py:func:`mrjob.compat.get_jobconf_value()`, which
+    jobconf values back, use :py:func:`mrjob.compat.jobconf_from_env()`, which
     ensures that the correct name is used depending on which version of Hadoop
     is active.
 

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Copyright 2009-2012 Yelp and Contributors
+# Copyright 2009-2013 Yelp and Contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ import hashlib
 
 try:
     from boto.emr.connection import EmrConnection
+    from boto.emr.step import JarStep
     import boto.exception
     import boto.utils
     boto  # quiet "redefinition of unused ..." warning from pyflakes
@@ -43,8 +44,6 @@ from mrjob.parse import parse_s3_uri
 DEFAULT_MAX_JOB_FLOWS_RETURNED = 500
 DEFAULT_MAX_DAYS_AGO = 61
 
-DEFAULT_JAR = '/stuff/hadoop-streaming.jar'
-
 # Size of each chunk returned by the MockKey iterator
 SIMULATED_BUFFER_SIZE = 256
 
@@ -55,6 +54,7 @@ AMI_VERSION_TO_HADOOP_VERSIONS = {
     None: ['0.18', '0.20'],
     '1.0': ['0.18', '0.20'],
     '2.0': ['0.20.205'],
+    '2.0.0': ['0.20.205'],
     'latest': ['0.20.205'],
 }
 
@@ -181,6 +181,8 @@ class MockKey(object):
         self.bucket = bucket
         self.name = name
         self.date_to_str = date_to_str or to_iso8601
+        # position in data, for read() and next()
+        self._pos = 0
 
     def read_mock_data(self):
         """Read the bytes for this key out of the fake boto state."""
@@ -218,12 +220,24 @@ class MockKey(object):
     def make_public(self):
         pass
 
-    def __iter__(self):
+    def read(self, size=None):
         data = self.read_mock_data()
-        i = 0
-        while i < len(data):
-            yield data[i:min(len(data), i + SIMULATED_BUFFER_SIZE)]
-            i += SIMULATED_BUFFER_SIZE
+        if size is None or size < 0:
+            chunk = data[self._pos:]
+        else:
+            chunk = data[self._pos:self._pos + size]
+        self._pos += len(chunk)
+        return chunk
+
+    def next(self):
+        chunk = self.read(SIMULATED_BUFFER_SIZE)
+        if chunk:
+            return chunk
+        else:
+            raise StopIteration
+
+    def __iter__(self):
+        return self
 
     def _get_last_modified(self):
         if self.name in self.bucket.mock_state():
@@ -274,6 +288,12 @@ class MockEmrConnection(object):
     """Mock out boto.emr.EmrConnection. This actually handles a small
     state machine that simulates EMR job flows."""
 
+    # hook for simulating SSL cert errors. To use this, do:
+    #
+    # with patch.object(MockEmrConnection, 'STRICT_SSL', True):
+    #     ...
+    STRICT_SSL = False
+
     def __init__(self, aws_access_key_id=None, aws_secret_access_key=None,
                  is_secure=True, port=None, proxy=None, proxy_port=None,
                  proxy_user=None, proxy_pass=None, debug=0,
@@ -282,7 +302,7 @@ class MockEmrConnection(object):
                  mock_emr_failures=None, mock_emr_output=None,
                  max_days_ago=DEFAULT_MAX_DAYS_AGO,
                  max_job_flows_returned=DEFAULT_MAX_JOB_FLOWS_RETURNED,
-                 max_simulation_steps=100):
+                 simulation_iterator=None):
         """Create a mock version of EmrConnection. Most of these args are
         the same as for the real EmrConnection, and are ignored.
 
@@ -314,10 +334,9 @@ class MockEmrConnection(object):
         :type max_days_ago: int
         :param max_days_ago: the maximum amount of days that EMR will go back
                              in time
-        :type max_simulation_steps: int
-        :param max_simulation_steps: the maximum number of times we can
-                                     simulate the progress of EMR job flows (to
-                                     protect against simulating forever)
+        :param simulation_iterator: we call ``next()`` on this each time
+                                    we simulate progress. If there is
+                                    no next element, we bail out.
         """
         self.mock_s3_fs = combine_values({}, mock_s3_fs)
         self.mock_emr_job_flows = combine_values({}, mock_emr_job_flows)
@@ -325,11 +344,18 @@ class MockEmrConnection(object):
         self.mock_emr_output = combine_values({}, mock_emr_output)
         self.max_days_ago = max_days_ago
         self.max_job_flows_returned = max_job_flows_returned
-        self.simulation_steps_left = max_simulation_steps
+        self.simulation_iterator = simulation_iterator
         if region is not None:
             self.endpoint = region.endpoint
         else:
             self.endpoint = 'elasticmapreduce.amazonaws.com'
+
+    def _enforce_strict_ssl(self):
+        if (self.STRICT_SSL and
+            not self.endpoint.endswith('elasticmapreduce.amazonaws.com')):
+            from boto.https_connection import InvalidCertificateException
+            raise InvalidCertificateException(
+                self.endpoint, None, 'hostname mismatch')
 
     def run_jobflow(self,
                     name, log_uri, ec2_keyname=None, availability_zone=None,
@@ -344,12 +370,14 @@ class MockEmrConnection(object):
                     additional_info=None,
                     ami_version=None,
                     now=None,
-                    visible_to_all_users=False):
+                    api_params=None):
         """Mock of run_jobflow().
 
         If you set log_uri to None, you can get a jobflow with no loguri
         attribute, which is useful for testing.
         """
+        self._enforce_strict_ssl()
+
         if now is None:
             now = datetime.utcnow()
 
@@ -380,7 +408,7 @@ class MockEmrConnection(object):
         def make_fake_action(real_action):
             return MockEmrObject(name=real_action.name,
                                  path=real_action.path,
-                                 args=[MockEmrObject(value=v) for v \
+                                 args=[MockEmrObject(value=str(v)) for v \
                                        in real_action.bootstrap_action_args])
 
         # create a MockEmrObject corresponding to the job flow. We only
@@ -504,7 +532,7 @@ class MockEmrConnection(object):
             normalizedinstancehours='9999',  # just need this filled in for now
             state='STARTING',
             steps=[],
-            visible_to_all_users=visible_to_all_users
+            visibletoallusers='false',  # can only be set with api_params
         )
 
         if slave_instance_type is not None:
@@ -518,21 +546,27 @@ class MockEmrConnection(object):
         if log_uri is not None:
             job_flow.loguri = log_uri
 
+        # include raw api params in job flow object
+        if api_params:
+            for k, v in api_params.iteritems():
+                setattr(job_flow, k.lower(), v)
+
         self.mock_emr_job_flows[jobflow_id] = job_flow
 
         if enable_debugging:
-            debugging_step = MockEmrObject(
-                name='Setup Hadoop Debugging',
-                action_on_failure='TERMINATE_JOB_FLOW',
-                jar=EmrConnection.DebuggingJar,
-                args=[MockEmrObject(value=EmrConnection.DebuggingArgs)],
-                state='COMPLETED')
+            debugging_step = JarStep(name='Setup Hadoop Debugging',
+                                     action_on_failure='TERMINATE_JOB_FLOW',
+                                     main_class=None,
+                                     jar=EmrConnection.DebuggingJar,
+                                     step_args=EmrConnection.DebuggingArgs)
             steps.insert(0, debugging_step)
         self.add_jobflow_steps(jobflow_id, steps)
 
         return jobflow_id
 
     def describe_jobflow(self, jobflow_id, now=None):
+        self._enforce_strict_ssl()
+
         if not jobflow_id in self.mock_emr_job_flows:
             raise boto.exception.S3ResponseError(404, 'Not Found')
 
@@ -542,6 +576,8 @@ class MockEmrConnection(object):
 
     def describe_jobflows(self, states=None, jobflow_ids=None,
                           created_after=None, created_before=None):
+        self._enforce_strict_ssl()
+
         now = datetime.utcnow()
 
         if created_before:
@@ -588,6 +624,8 @@ class MockEmrConnection(object):
         return jfs
 
     def add_jobflow_steps(self, jobflow_id, steps):
+        self._enforce_strict_ssl()
+
         if not jobflow_id in self.mock_emr_job_flows:
             raise boto.exception.S3ResponseError(404, 'Not Found')
 
@@ -601,13 +639,15 @@ class MockEmrConnection(object):
                 state='PENDING',
                 name=step.name,
                 actiononfailure=step.action_on_failure,
-                args=step.args,
-                jar=DEFAULT_JAR,
+                args=[MockEmrObject(value=arg) for arg in step.args()],
+                jar=step.jar(),
             )
             job_flow.state = 'PENDING'
             job_flow.steps.append(step_object)
 
     def terminate_jobflow(self, jobflow_id):
+        self._enforce_strict_ssl()
+
         if not jobflow_id in self.mock_emr_job_flows:
             raise boto.exception.S3ResponseError(404, 'Not Found')
 
@@ -625,10 +665,9 @@ class MockEmrConnection(object):
         """Figure out the output dir for a step by parsing step.args
         and looking for an -output argument."""
         # parse in reverse order, in case there are multiple -output args
-        args = step.args()
-        for i, arg in reversed(list(enumerate(args[:-1]))):
-            if arg == '-output':
-                return args[i + 1]
+        for i, arg in reversed(list(enumerate(step.args[:-1]))):
+            if arg.value == '-output':
+                return step.args[i + 1].value
         else:
             return None
 
@@ -644,10 +683,12 @@ class MockEmrConnection(object):
         if now is None:
             now = datetime.utcnow()
 
-        if self.simulation_steps_left <= 0:
-            raise AssertionError(
-                'Simulated progress too many times; bailing out')
-        self.simulation_steps_left -= 1
+        if self.simulation_iterator:
+            try:
+                self.simulation_iterator.next()
+            except StopIteration:
+                raise AssertionError(
+                    'Simulated progress too many times; bailing out')
 
         job_flow = self.mock_emr_job_flows[jobflow_id]
 
@@ -682,6 +723,10 @@ class MockEmrConnection(object):
             if step.name in ('Setup Hadoop Debugging', ):
                 step.state = 'COMPLETED'
                 continue
+
+            # allow steps to get stuck
+            if getattr(step, 'mock_no_progress', None):
+                return
 
             # found currently running step! going to handle it, then exit
             if step.state == 'PENDING':
